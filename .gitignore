@@ -1,4 +1,11 @@
 /target
 /result
 
+# Local Arch package build output.
+/*.pkg.tar.*
+/packaging/aur/*/*.pkg.tar.*
+/packaging/aur/*/niri/
+/packaging/aur/*/pkg/
+/packaging/aur/*/src/
+
 .idea
