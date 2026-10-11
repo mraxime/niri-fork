@@ -25,30 +25,48 @@ failed required checks leave both published heads unchanged.
 GitHub schedules can be delayed or disabled after 60 days of public-repository
 inactivity. Keep Actions failure notifications enabled in your GitHub settings.
 
-## Build and update
+## Paru installation and updates
+
+`niri-max-git` replaces stock `niri` through package conflicts. It provides the
+actual upstream `niri` version and `wayland-compositor`, uses native names, and includes
+upstream portals, documentation, and shell completions. User configuration stays
+unchanged. Restart the Niri session when ready to use the installed build.
+
+Add to `~/.config/paru/paru.conf`, preserving other entries:
+
+```ini
+Include = /etc/paru.conf
+
+[niri-max]
+Url = https://github.com/mraxime/niri-fork.git
+Path = packaging/aur
+```
+
+Keep `Devel` enabled in the included system configuration. Paru discovers the
+PKGBUILD on the repository's default `fork` branch; its Git source explicitly
+tracks `fork`, including rewritten heads. No AUR registration is needed.
+
+```sh
+paru -S niri-max-git
+paru -Syu
+```
+
+The first command builds and installs, prompting to remove conflicting stock
+`niri`. The second refreshes repositories and checks Git-source updates. Package
+versions combine niri's native version with commit time and hash, without tags.
+Commit time keeps versions ordered when revision counts shrink during rebases.
+Paru records the installed Git ref during installation; package review stays enabled.
+
+For a build without installation:
 
 ```sh
 git clone https://github.com/mraxime/niri-fork.git
-cd niri-fork
+cd niri-fork/packaging/aur/niri-max-git
 makepkg
 ```
 
-The co-installable package depends on stock `niri`. It installs separate
-`niri-fork`, `niri-fork-session`, `niri-fork.service`, and `niri-fork.desktop` paths;
-stock niri and user configuration stay unchanged. Installation is optional:
-`sudo pacman -U <built-package>`. No AUR or automatic package updates are configured.
-
-After automatic rebases, update a **clean** checkout:
-
-```sh
-git fetch origin
-git switch fork
-git reset --hard origin/fork
-makepkg --force
-```
-
-Save local changes before resetting. Package versions use commit time because
-revision counts can shrink during rebases.
+To update a local checkout after automatic rebases, save local changes, fetch
+`origin`, and reset the clean `fork` branch to `origin/fork` before rebuilding.
 
 ## Conflict recovery
 
