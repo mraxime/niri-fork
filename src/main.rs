@@ -194,6 +194,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap();
 
+    state.niri.layout.enable_single_window_fill();
+
     // Set WAYLAND_DISPLAY for children.
     let socket_name = state.niri.socket_name.as_deref().unwrap();
     env::set_var("WAYLAND_DISPLAY", socket_name);
