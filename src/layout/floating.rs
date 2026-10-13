@@ -16,7 +16,7 @@ use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
 };
 use crate::animation::{Animation, Clock};
-use crate::layout::RenderLayer;
+use crate::layout::{AutoMaximize, RenderLayer};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
@@ -423,6 +423,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     }
 
     fn add_tile_at(&mut self, mut idx: usize, mut tile: Tile<W>, activate: bool) {
+        tile.auto_maximize = AutoMaximize::Inactive;
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
         // Restore the previous floating window size, and in case the tile is fullscreen,

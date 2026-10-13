@@ -20,7 +20,7 @@ use super::workspace::{
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
-use crate::layout::RenderLayer;
+use crate::layout::{AutoMaximize, RenderLayer};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -519,6 +519,7 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_window(
         &mut self,
         window: W,
@@ -527,10 +528,12 @@ impl<W: LayoutElement> Monitor<W> {
         width: ColumnWidth,
         is_full_width: bool,
         is_floating: bool,
+        auto_maximize: AutoMaximize,
     ) {
         // Currently, everything a workspace sets on a Tile is the same across all workspaces of a
         // monitor. So we can use any workspace, not necessarily the exact target workspace.
-        let tile = self.workspaces[0].make_tile(window);
+        let mut tile = self.workspaces[0].make_tile(window);
+        tile.auto_maximize = auto_maximize;
 
         self.add_tile(
             tile,

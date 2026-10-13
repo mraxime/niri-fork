@@ -39,7 +39,7 @@ use tracing::field::Empty;
 use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
 use crate::input::{AnyStartData, DOUBLE_CLICK_TIME};
-use crate::layout::ActivateWindow;
+use crate::layout::{ActivateWindow, AutoMaximize};
 use crate::niri::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -480,7 +480,7 @@ impl XdgShellHandler for State {
                 InitialConfigureState::NotConfigured {
                     wants_maximized, ..
                 } => {
-                    *wants_maximized = true;
+                    *wants_maximized = Some(true);
 
                     // The required configure will be the initial configure.
                 }
@@ -488,8 +488,10 @@ impl XdgShellHandler for State {
                     rules,
                     output,
                     is_pending_maximized,
+                    auto_maximize,
                     ..
                 } => {
+                    *auto_maximize = AutoMaximize::Inactive;
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
                     let mon = output
@@ -562,7 +564,7 @@ impl XdgShellHandler for State {
                 InitialConfigureState::NotConfigured {
                     wants_maximized, ..
                 } => {
-                    *wants_maximized = false;
+                    *wants_maximized = Some(false);
 
                     // The required configure will be the initial configure.
                 }
@@ -576,6 +578,7 @@ impl XdgShellHandler for State {
                     output,
                     workspace_name,
                     is_pending_maximized,
+                    auto_maximize,
                 } => {
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
@@ -622,6 +625,7 @@ impl XdgShellHandler for State {
                                 .or_else(|| self.niri.layout.active_workspace())
                         });
 
+                    *auto_maximize = AutoMaximize::PreserveNormalOnOpen;
                     if let Some(ws) = ws {
                         // If the window is pending fullscreen, then this will do nothing since
                         // then the Maximized state is already unset. But that's expected: the
@@ -787,6 +791,7 @@ impl XdgShellHandler for State {
                     output,
                     workspace_name,
                     is_pending_maximized,
+                    auto_maximize,
                 } => {
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
@@ -837,7 +842,7 @@ impl XdgShellHandler for State {
                         toplevel.with_pending_state(|state| {
                             state.states.unset(xdg_toplevel::State::Fullscreen);
 
-                            if *is_pending_maximized {
+                            if *is_pending_maximized || *auto_maximize == AutoMaximize::Active {
                                 state.states.set(xdg_toplevel::State::Maximized);
                             }
                         });
@@ -1132,10 +1137,11 @@ impl State {
         });
 
         // If not, check if this is a dialog with a parent, to place it next to the parent.
+        let parent = toplevel
+            .parent()
+            .and_then(|parent| self.niri.layout.find_window_and_output(&parent));
         let mon = mon.map(|mon| (mon, false)).or_else(|| {
-            toplevel
-                .parent()
-                .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
+            parent
                 .and_then(|(_win, output)| output)
                 .and_then(|o| self.niri.layout.monitor_for_output(o))
                 .map(|mon| (mon, true))
@@ -1163,8 +1169,8 @@ impl State {
         let is_full_width = rules.open_maximized.unwrap_or(false);
         let is_floating = rules.compute_open_floating(toplevel);
 
-        // Tell the surface the preferred size and bounds for its likely output.
-        let ws = rules
+        // Preserve the fallback destination separately from parent-following sizing.
+        let fallback_ws = rules
             .open_on_workspace
             .as_deref()
             .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
@@ -1173,11 +1179,37 @@ impl State {
                     .or_else(|| self.niri.layout.active_workspace())
             });
 
+        // Mapping follows a compatible parent even when its workspace isn't active.
+        let single_window_fill = self.niri.layout.single_window_fill_enabled();
+        let ws = parent
+            .filter(|_| single_window_fill)
+            .filter(|(_, parent_output)| {
+                parent_output.is_none() || output.is_none() || output.as_ref() == *parent_output
+            })
+            .and_then(|(win, _)| {
+                self.niri
+                    .layout
+                    .workspaces()
+                    .find(|(_, _, ws)| ws.has_window(&win.window))
+            })
+            .map(|(_, _, ws)| ws)
+            .or(fallback_ws);
+
+        let maximized = rules.open_maximized_to_edges.or(*wants_maximized);
         let mut is_pending_maximized = false;
+        let auto_maximize = match maximized {
+            Some(false) => AutoMaximize::PreserveNormalOnOpen,
+            None if single_window_fill
+                && !is_floating
+                && ws.is_some_and(|ws| ws.scrolling().is_empty()) =>
+            {
+                AutoMaximize::Active
+            }
+            _ => AutoMaximize::Inactive,
+        };
         if let Some(ws) = ws {
             // Set a fullscreen and maximized state based on window request and window rule.
-            is_pending_maximized = (*wants_maximized && rules.open_maximized_to_edges.is_none())
-                || rules.open_maximized_to_edges == Some(true);
+            is_pending_maximized = maximized == Some(true);
 
             if (wants_fullscreen.is_some() && rules.open_fullscreen.is_none())
                 || rules.open_fullscreen == Some(true)
@@ -1185,7 +1217,7 @@ impl State {
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                 });
-            } else if is_pending_maximized {
+            } else if is_pending_maximized || auto_maximize == AutoMaximize::Active {
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Maximized);
                 });
@@ -1225,8 +1257,9 @@ impl State {
             floating_height,
             is_full_width,
             output,
-            workspace_name: ws.and_then(|w| w.name().cloned()),
+            workspace_name: fallback_ws.and_then(|w| w.name().cloned()),
             is_pending_maximized,
+            auto_maximize,
         };
 
         trace!(surface = %toplevel.wl_surface().id(), "sending initial configure");

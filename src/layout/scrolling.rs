@@ -18,7 +18,7 @@ use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
-use crate::layout::{RenderLayer, SizingMode};
+use crate::layout::{AutoMaximize, RenderLayer, SizingMode};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
@@ -919,7 +919,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             is_full_width,
         );
 
-        self.add_column(col_idx, column, activate, anim);
+        self.add_column(col_idx, column, activate, anim, true);
     }
 
     pub fn add_tile_to_column(
@@ -1002,6 +1002,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         mut column: Column<W>,
         activate: bool,
         anim_config: Option<niri_config::Animation>,
+        needs_initial_size: bool,
     ) {
         let was_empty = self.columns.is_empty();
 
@@ -1013,13 +1014,28 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             }
         });
 
-        column.update_config(
+        if self.columns.len() == 1 && self.columns[0].set_auto_maximized(false) {
+            self.columns[0].update_tile_sizes(true);
+            self.data[0].update(&self.columns[0]);
+        }
+        // Opening intent lasts through this insertion, not later population changes.
+        let mode_changed = if column.tiles[0].auto_maximize == AutoMaximize::PreserveNormalOnOpen {
+            column.tiles[0].auto_maximize = AutoMaximize::Inactive;
+            false
+        } else {
+            column.set_auto_maximized(was_empty)
+        };
+        let resized = column.update_config(
             self.view_size,
             self.working_area,
             self.parent_area,
             self.scale,
             self.options.clone(),
         );
+        // Fresh columns need their first size; unchanged transferred columns don't need another.
+        if (needs_initial_size || mode_changed) && !resized {
+            column.update_tile_sizes(true);
+        }
         self.data.insert(idx, ColumnData::new(&column));
         self.columns.insert(idx, column);
 
@@ -1068,6 +1084,17 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let column = &self.columns[column_idx];
 
         let tile_idx = column.position(window).unwrap();
+        if column.tiles.len() == 1 {
+            self.prepare_remove_column(column_idx, transaction.clone());
+        } else if self.options.single_window_fill
+            && self.columns.len() == 1
+            && column.tiles.len() == 2
+            && !column.is_pending_maximized
+        {
+            let column = &mut self.columns[column_idx];
+            column.tiles[1 - tile_idx].auto_maximize = AutoMaximize::Active;
+            column.is_pending_maximized = true;
+        }
         self.remove_tile_by_idx(column_idx, tile_idx, transaction, None)
     }
 
@@ -1186,7 +1213,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return None;
         }
 
+        self.prepare_remove_column(self.active_column_idx, Transaction::new());
         Some(self.remove_column_by_idx(self.active_column_idx, None))
+    }
+
+    // Only membership removals call this; consume/expel use the primitives directly.
+    fn prepare_remove_column(&mut self, column_idx: usize, transaction: Transaction) {
+        if self.columns.len() == 2 {
+            let column = &mut self.columns[1 - column_idx];
+            if column.set_auto_maximized(true) {
+                column.update_tile_sizes_with_transaction(true, transaction);
+                self.data[1 - column_idx].update(column);
+            }
+        }
     }
 
     pub fn remove_column_by_idx(
@@ -2712,6 +2751,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         cancel_resize_for_column(&mut self.interactive_resize, col);
     }
 
+    pub fn set_initial_window_height(&mut self, window: &W::Id, change: SizeChange) {
+        let col = self
+            .columns
+            .iter_mut()
+            .find(|col| col.contains(window))
+            .unwrap();
+        col.store_window_height(change, col.position(window));
+        if col.pending_sizing_mode().is_normal() {
+            col.update_tile_sizes(false);
+        }
+    }
+
     pub fn reset_window_height(&mut self, window: Option<&W::Id>) {
         if self.columns.is_empty() {
             return;
@@ -2790,6 +2841,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         let col = &mut self.columns[self.active_column_idx];
+        if col.tiles[0].auto_maximize == AutoMaximize::Active && !col.is_pending_fullscreen {
+            col.set_auto_maximized(false);
+            col.is_full_width = true;
+            col.update_tile_sizes(true);
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            return;
+        }
         if !col.pending_sizing_mode().is_normal() || col.is_full_width {
             return;
         }
@@ -2919,7 +2977,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .position(|col| col.contains(window))
             .unwrap();
 
+        // Explicit intent takes ownership even if the requested mode is unchanged.
+        self.columns[col_idx].tiles[0].auto_maximize = AutoMaximize::Inactive;
         if maximize == self.columns[col_idx].is_pending_maximized {
+            if maximize {
+                cancel_resize_for_column(&mut self.interactive_resize, &mut self.columns[col_idx]);
+            }
             return false;
         }
 
@@ -3585,7 +3648,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .find(|col| col.contains(&window))
             .unwrap();
 
-        if !col.pending_sizing_mode().is_normal() {
+        if col.is_pending_fullscreen
+            || (col.is_pending_maximized && col.tiles[0].auto_maximize != AutoMaximize::Active)
+        {
             return false;
         }
 
@@ -3985,6 +4050,7 @@ impl WindowHeight {
 }
 
 impl<W: LayoutElement> Column<W> {
+    /// Construct without requesting sizes; insertion resolves policy and destination config first.
     #[allow(clippy::too_many_arguments)]
     fn new_with_tile(
         tile: Tile<W>,
@@ -3996,6 +4062,9 @@ impl<W: LayoutElement> Column<W> {
         is_full_width: bool,
     ) -> Self {
         let options = tile.options.clone();
+        let pending = tile.window().pending_sizing_mode();
+        let clock = tile.clock.clone();
+        let data = TileData::new(&tile, WindowHeight::auto_1());
 
         let display_mode = tile
             .window()
@@ -4020,14 +4089,14 @@ impl<W: LayoutElement> Column<W> {
             .position(|preset| width == ColumnWidth::from(*preset));
 
         let mut rv = Self {
-            tiles: vec![],
-            data: vec![],
+            tiles: vec![tile],
+            data: vec![data],
             active_tile_idx: 0,
             width,
             preset_width_idx,
             is_full_width,
-            is_pending_maximized: false,
-            is_pending_fullscreen: false,
+            is_pending_maximized: pending.is_maximized(),
+            is_pending_fullscreen: pending.is_fullscreen(),
             display_mode,
             tab_indicator: TabIndicator::new(options.layout.tab_indicator),
             move_x_animation: None,
@@ -4036,20 +4105,10 @@ impl<W: LayoutElement> Column<W> {
             working_area,
             parent_area,
             scale,
-            clock: tile.clock.clone(),
+            clock,
             options,
             id: ColumnId::next(),
         };
-
-        let pending_sizing_mode = tile.window().pending_sizing_mode();
-
-        rv.add_tile_at(0, tile);
-
-        match pending_sizing_mode {
-            SizingMode::Normal => (),
-            SizingMode::Maximized => rv.set_maximized(true),
-            SizingMode::Fullscreen => rv.set_fullscreen(true),
-        }
 
         // Animate the tab indicator for new columns.
         if display_mode == ColumnDisplay::Tabbed
@@ -4076,7 +4135,7 @@ impl<W: LayoutElement> Column<W> {
         parent_area: Rectangle<f64, Logical>,
         scale: f64,
         options: Rc<Options>,
-    ) {
+    ) -> bool {
         let mut update_sizes = false;
 
         if self.view_size != view_size
@@ -4127,6 +4186,7 @@ impl<W: LayoutElement> Column<W> {
         if update_sizes {
             self.update_tile_sizes(false);
         }
+        update_sizes
     }
 
     pub fn update_shaders(&mut self) {
@@ -4451,6 +4511,8 @@ impl<W: LayoutElement> Column<W> {
         let mut prev_offsets = Vec::with_capacity(self.tiles.len() + 1);
         prev_offsets.extend(self.tile_offsets().take(self.tiles.len()));
 
+        self.set_auto_maximized(false);
+        tile.auto_maximize = AutoMaximize::Inactive;
         if self.display_mode != ColumnDisplay::Tabbed {
             self.is_pending_fullscreen = false;
             self.is_pending_maximized = false;
@@ -4994,6 +5056,7 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn toggle_full_width(&mut self) {
+        self.tiles[0].auto_maximize = AutoMaximize::Inactive;
         if self.is_pending_maximized {
             // Treat it as unmaximize.
             self.is_pending_maximized = false;
@@ -5056,11 +5119,19 @@ impl<W: LayoutElement> Column<W> {
         self.width = width;
         self.preset_width_idx = None;
         self.is_full_width = false;
+        self.tiles[0].auto_maximize = AutoMaximize::Inactive;
         self.is_pending_maximized = false;
         self.update_tile_sizes(animate);
     }
 
     fn set_window_height(&mut self, change: SizeChange, tile_idx: Option<usize>, animate: bool) {
+        self.store_window_height(change, tile_idx);
+        self.tiles[0].auto_maximize = AutoMaximize::Inactive;
+        self.is_pending_maximized = false;
+        self.update_tile_sizes(animate);
+    }
+
+    fn store_window_height(&mut self, change: SizeChange, tile_idx: Option<usize>) {
         let tile_idx = tile_idx.unwrap_or(self.active_tile_idx);
 
         // Start by converting all heights to automatic, since only one window in the column can be
@@ -5135,11 +5206,10 @@ impl<W: LayoutElement> Column<W> {
         }
 
         self.data[tile_idx].height = WindowHeight::Fixed(window_height.clamp(1., MAX_PX));
-        self.is_pending_maximized = false;
-        self.update_tile_sizes(animate);
     }
 
     fn reset_window_height(&mut self, tile_idx: Option<usize>) {
+        self.set_auto_maximized(false);
         if self.display_mode == ColumnDisplay::Tabbed {
             // When tabbed, reset window height should work on any window, not just the fixed-size
             // one.
@@ -5205,6 +5275,7 @@ impl<W: LayoutElement> Column<W> {
             }
         };
         self.data[tile_idx].height = WindowHeight::Preset(preset_idx);
+        self.tiles[0].auto_maximize = AutoMaximize::Inactive;
         self.is_pending_maximized = false;
         self.update_tile_sizes(true);
     }
@@ -5242,6 +5313,25 @@ impl<W: LayoutElement> Column<W> {
 
         self.is_pending_fullscreen = is_fullscreen;
         self.update_tile_sizes(true);
+    }
+
+    /// Change policy ownership without preparing an intermediate geometry.
+    fn set_auto_maximized(&mut self, sole: bool) -> bool {
+        let old_mode = self.pending_sizing_mode();
+        if self.tiles[0].auto_maximize == AutoMaximize::Active {
+            self.is_pending_maximized = false;
+        }
+        self.tiles[0].auto_maximize = if self.options.single_window_fill
+            && sole
+            && self.tiles.len() == 1
+            && !self.is_pending_maximized
+        {
+            self.is_pending_maximized = true;
+            AutoMaximize::Active
+        } else {
+            AutoMaximize::Inactive
+        };
+        old_mode != self.pending_sizing_mode()
     }
 
     fn set_maximized(&mut self, maximize: bool) {

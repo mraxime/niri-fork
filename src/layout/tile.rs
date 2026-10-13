@@ -16,7 +16,7 @@ use super::{
     SizeFrac, RESIZE_ANIMATION_THRESHOLD,
 };
 use crate::animation::{Animation, Clock};
-use crate::layout::SizingMode;
+use crate::layout::{AutoMaximize, SizingMode};
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
@@ -61,6 +61,9 @@ pub struct Tile<W: LayoutElement> {
 
     /// Whether the tile should float upon unfullscreening.
     pub(super) restore_to_floating: bool,
+
+    /// Sole-tiled-window maximization ownership, carried with the tile during transfers.
+    pub(super) auto_maximize: AutoMaximize,
 
     /// The size that the window should assume when going floating.
     ///
@@ -201,6 +204,7 @@ impl<W: LayoutElement> Tile<W> {
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), fullscreen_backdrop_color),
             restore_to_floating: false,
+            auto_maximize: AutoMaximize::Inactive,
             floating_window_size: None,
             floating_pos: None,
             floating_preset_width_idx: None,

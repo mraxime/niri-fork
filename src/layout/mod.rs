@@ -128,6 +128,15 @@ pub enum SizingMode {
     Fullscreen,
 }
 
+/// Ownership of sole-tiled-window maximization, including the initial insertion handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoMaximize {
+    Inactive,
+    Active,
+    /// Preserve explicit normal opening intent, then consume it on insertion.
+    PreserveNormalOnOpen,
+}
+
 pub trait LayoutElement {
     /// Type that can be used as a unique ID of this element.
     type Id: PartialEq + std::fmt::Debug + Clone;
@@ -400,6 +409,8 @@ pub struct Options {
     pub gestures: niri_config::Gestures,
     pub overview: niri_config::Overview,
     pub blur: niri_config::Blur,
+    /// Embedding policy: automatically fill the work area with the sole tiled window.
+    pub single_window_fill: bool,
     // Debug flags.
     pub disable_resize_throttling: bool,
     pub disable_transactions: bool,
@@ -669,6 +680,7 @@ impl Options {
             gestures: config.gestures,
             overview: config.overview,
             blur: config.blur,
+            single_window_fill: false,
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,
             deactivate_unfocused_windows: config.debug.deactivate_unfocused_windows,
@@ -715,6 +727,18 @@ impl RenderLayer {
 impl<W: LayoutElement> Layout<W> {
     pub fn new(clock: Clock, config: &Config) -> Self {
         Self::with_options_and_workspaces(clock, config, Options::from_config(config))
+    }
+
+    /// Enable before any client event dispatch; this policy cannot be disabled later.
+    pub fn enable_single_window_fill(&mut self) {
+        assert!(self.windows().next().is_none(), "windows already mapped");
+        let mut options = Options::clone(&self.options);
+        options.single_window_fill = true;
+        self.update_options(options);
+    }
+
+    pub(crate) fn single_window_fill_enabled(&self) -> bool {
+        self.options.single_window_fill
     }
 
     pub fn with_options(clock: Clock, options: Options) -> Self {
@@ -978,6 +1002,7 @@ impl<W: LayoutElement> Layout<W> {
         height: Option<PresetSize>,
         is_full_width: bool,
         is_floating: bool,
+        auto_maximize: AutoMaximize,
         activate: ActivateWindow,
     ) -> Option<&Output> {
         let scrolling_height = height.map(SizeChange::from);
@@ -1055,6 +1080,7 @@ impl<W: LayoutElement> Layout<W> {
                     scrolling_width,
                     is_full_width,
                     is_floating,
+                    auto_maximize,
                 );
 
                 if activate.map_smart(|| false) {
@@ -1069,7 +1095,7 @@ impl<W: LayoutElement> Layout<W> {
                             .iter_mut()
                             .find(|ws| ws.has_window(&id))
                             .unwrap();
-                        ws.set_window_height(Some(&id), change);
+                        ws.scrolling_mut().set_initial_window_height(&id, change);
                     }
                 }
 
@@ -1129,7 +1155,8 @@ impl<W: LayoutElement> Layout<W> {
 
                 let scrolling_width = ws.resolve_scrolling_width(&window, width);
 
-                let tile = ws.make_tile(window);
+                let mut tile = ws.make_tile(window);
+                tile.auto_maximize = auto_maximize;
                 ws.add_tile(
                     tile,
                     target,
@@ -1143,7 +1170,7 @@ impl<W: LayoutElement> Layout<W> {
                 // Set the default height for scrolling windows.
                 if !is_floating {
                     if let Some(change) = scrolling_height {
-                        ws.set_window_height(Some(&id), change);
+                        ws.scrolling_mut().set_initial_window_height(&id, change);
                     }
                 }
 
@@ -3003,7 +3030,8 @@ impl<W: LayoutElement> Layout<W> {
         self.update_options(Options::from_config(config));
     }
 
-    fn update_options(&mut self, options: Options) {
+    fn update_options(&mut self, mut options: Options) {
+        options.single_window_fill |= self.options.single_window_fill;
         let options = Rc::new(options);
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
@@ -3445,6 +3473,15 @@ impl<W: LayoutElement> Layout<W> {
                 .position(|mon| &mon.output == output)
                 .unwrap();
 
+            let workspace_idx = target_ws_idx
+                .unwrap_or(monitors[new_idx].active_workspace_idx)
+                .min(monitors[new_idx].workspaces.len() - 1);
+            if new_idx == *active_monitor_idx
+                && workspace_idx == monitors[new_idx].active_workspace_idx
+            {
+                return;
+            }
+
             let current = &mut monitors[*active_monitor_idx];
             let ws = current.active_workspace();
 
@@ -3457,9 +3494,6 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             };
 
-            let workspace_idx = target_ws_idx
-                .unwrap_or(monitors[new_idx].active_workspace_idx)
-                .min(monitors[new_idx].workspaces.len() - 1);
             self.add_column_by_idx(new_idx, workspace_idx, column, activate);
         }
     }
