@@ -1,0 +1,197 @@
+name: Fork CI and upstream sync
+
+on:
+  push:
+    branches: [fork]
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: 'https://github.com/niri-wm/niri.git'
+  UPSTREAM_BRANCH: 'main'
+
+jobs:
+  sync:
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || 'fork' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare sync
+        id: prepare
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == push ]]; then
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch origin '+refs/heads/fork:refs/remotes/origin/fork'
+          previous=$(git rev-parse refs/remotes/origin/fork)
+          git checkout --detach "$previous"
+          git fetch "$UPSTREAM_URL" "+refs/heads/$UPSTREAM_BRANCH:refs/remotes/upstream/$UPSTREAM_BRANCH"
+          upstream=$(git rev-parse "refs/remotes/upstream/$UPSTREAM_BRANCH")
+          if [[ "$EVENT" == schedule ]] && git merge-base --is-ancestor "$upstream" HEAD; then
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rebase "$upstream"
+          candidate=$(git rev-parse HEAD)
+          {
+            echo "previous=$previous"
+            echo "candidate=$candidate"
+            echo 'needed=true'
+          } >> "$GITHUB_OUTPUT"
+      - name: Free disk space
+        if: steps.prepare.outputs.needed == 'true'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+      - name: Repository setup
+        if: steps.prepare.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y curl gcc clang libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libpango1.0-dev libdisplay-info-dev libadwaita-1-dev
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          rustup toolchain install 1.87.0 --profile minimal
+      - name: FreeBSD build
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.1'
+          copyback: 'false'
+          prepare: |
+            pkg update -f
+            pkg install -y git curl rust llvm pkgconf pixman libudev-devd libdisplay-info seatd libinput libxkbcommon pipewire mesa-libs cairo devel/glib20 gettext-runtime harfbuzz pango
+          run: |
+            set -eu
+            export CARGO_HOME="$PWD/cargo-home"
+
+            cargo fetch
+
+            (
+              cd "$CARGO_HOME"/registry/src/index.crates.io-*/
+              patch -p0 <<'PATCH'
+            --- pipewire-sys-0.10.1/build.rs
+            +++ pipewire-sys-0.10.1/build.rs
+            @@ -23,6 +23,8 @@
+                     .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+                     .size_t_is_usize(true)
+                     .allowlist_function("pw_.*")
+            +        .allowlist_function("pipewire_init")
+            +        .allowlist_function("pipewire_deinit")
+                     .allowlist_type("pw_.*")
+                     .allowlist_var("pw_.*")
+                     .allowlist_var("PW_.*")
+            --- pipewire-sys-0.10.1/src/lib.rs
+            +++ pipewire-sys-0.10.1/src/lib.rs
+            @@ -13,0 +14,7 @@
+            +
+            +// On FreeBSD, pw_init and pw_deinit are macros aliasing pipewire_init/pipewire_deinit,
+            +// so bindgen generates the underlying symbol names. Re-export them under the expected names.
+            +#[cfg(target_os = "freebsd")]
+            +pub use bindings::pipewire_init as pw_init;
+            +#[cfg(target_os = "freebsd")]
+            +pub use bindings::pipewire_deinit as pw_deinit;
+            --- libdisplay-info-sys-0.3.0/Cargo.toml
+            +++ libdisplay-info-sys-0.3.0/Cargo.toml
+            @@ -45 +45 @@
+            -version = ">= 0.1.0, < 0.4.0"
+            +version = ">= 0.1.0"
+            PATCH
+            )
+
+            cargo build \
+              --offline \
+              --no-default-features --features dbus,xdp-gnome-screencast
+        if: steps.prepare.outputs.needed == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.prepare.outputs.needed == 'true'
+      - name: Required checks
+        if: steps.prepare.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +nightly fmt --all -- --check
+          cargo +stable test --no-run --all --exclude niri-visual-tests
+          cargo +stable test --all --exclude niri-visual-tests -- --nocapture
+          cargo +stable check --no-default-features
+          cargo +stable check --no-default-features --features dbus
+          cargo +stable check --no-default-features --features systemd
+          cargo +stable check --no-default-features --features dinit
+          cargo +stable check --no-default-features --features xdp-gnome-screencast
+          cargo +stable check
+          cargo +stable build --features profile-with-tracy
+          cargo +stable build --package niri-visual-tests
+          cargo +stable clippy --all --all-targets
+          CARGO_TARGET_DIR="$RUNNER_TEMP/msrv-target" cargo +1.87.0 check --all-targets
+          rm -rf -- "$RUNNER_TEMP/msrv-target"
+          cargo +stable test --no-run --all --exclude niri-visual-tests --release
+          RUST_BACKTRACE=1 RUN_SLOW_TESTS=1 PROPTEST_CASES=200000 \
+            PROPTEST_MAX_LOCAL_REJECTS=200000 PROPTEST_MAX_GLOBAL_REJECTS=200000 \
+            PROPTEST_MAX_SHRINK_ITERS=200000 \
+            cargo +stable test --all --exclude niri-visual-tests --release
+      - name: Alpine and Fedora builds
+        if: steps.prepare.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir=$(mktemp -d "$RUNNER_TEMP/fork-platform.XXXXXX")
+          trap 'rm -rf "$source_dir"' EXIT
+          git archive HEAD | tar -x -C "$source_dir"
+          docker run --rm -v "$source_dir:/source:ro" -w /source \
+            -e CARGO_TARGET_DIR=/tmp/target alpine:3 sh -ec '
+              apk add --no-cache cargo clang-libclang eudev-dev glib-dev libdisplay-info-dev libinput-dev libseat-dev libxkbcommon-dev mesa-dev pango-dev pipewire-dev tar git
+              cargo build --no-default-features --features dbus,xdp-gnome-screencast
+            '
+          docker run --rm -v "$source_dir:/source:ro" -w /source \
+            -e CARGO_TARGET_DIR=/tmp/target fedora:42 sh -ec '
+              dnf update -y
+              dnf install -y cargo gcc clang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel pango-devel cairo-gobject-devel libdisplay-info-devel libadwaita-devel git
+              cargo build --all
+            '
+      - name: Install Nix
+        if: steps.prepare.outputs.needed == 'true'
+        uses: cachix/install-nix-action@v31
+        continue-on-error: true
+      - name: Nix check (advisory)
+        if: steps.prepare.outputs.needed == 'true'
+        shell: bash
+        run: nix flake check
+        continue-on-error: true
+      - name: Publish
+        if: github.event_name != 'push' && steps.prepare.outputs.needed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS: ${{ steps.prepare.outputs.previous }}
+          CANDIDATE: ${{ steps.prepare.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+          git diff --exit-code
+          git diff --cached --exit-code
+          # shellcheck disable=SC2016 # Git evaluates the helper in a child shell.
+          git -c credential.helper='!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' \
+            push --atomic --force-with-lease="refs/heads/fork:$PREVIOUS" origin \
+              HEAD:refs/heads/fork "refs/remotes/upstream/$UPSTREAM_BRANCH:refs/heads/$UPSTREAM_BRANCH"
