@@ -19,7 +19,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
-use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
+use crate::layout::{ActivateWindow, AddWindowTarget, AutoMaximize, LayoutElement as _};
 use crate::niri::{CastTarget, ClientState, LockState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{is_mapped, send_scale_transform};
@@ -98,6 +98,7 @@ impl CompositorHandler for State {
                         output,
                         workspace_id,
                         is_pending_maximized,
+                        auto_maximize,
                     ) = if let InitialConfigureState::Configured {
                         rules,
                         width,
@@ -108,6 +109,7 @@ impl CompositorHandler for State {
                         output,
                         workspace_name,
                         is_pending_maximized,
+                        auto_maximize,
                     } = state
                     {
                         // Check that the output is still connected.
@@ -128,6 +130,7 @@ impl CompositorHandler for State {
                             output,
                             workspace_id,
                             is_pending_maximized,
+                            auto_maximize,
                         )
                     } else {
                         // Can happen when a surface unmaps by attaching a null buffer while
@@ -141,6 +144,7 @@ impl CompositorHandler for State {
                             None,
                             None,
                             false,
+                            AutoMaximize::Inactive,
                         )
                     };
 
@@ -217,6 +221,7 @@ impl CompositorHandler for State {
                         height,
                         is_full_width,
                         is_floating,
+                        auto_maximize,
                         activate,
                     );
                     let output = output.cloned();

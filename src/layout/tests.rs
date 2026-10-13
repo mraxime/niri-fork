@@ -915,6 +915,7 @@ impl Op {
                     None,
                     false,
                     is_floating,
+                    AutoMaximize::Inactive,
                     ActivateWindow::default(),
                 );
             }
@@ -984,6 +985,7 @@ impl Op {
                     None,
                     false,
                     is_floating,
+                    AutoMaximize::Inactive,
                     ActivateWindow::default(),
                 );
             }
@@ -1058,6 +1060,7 @@ impl Op {
                     None,
                     false,
                     is_floating,
+                    AutoMaximize::Inactive,
                     ActivateWindow::default(),
                 );
             }
@@ -1654,6 +1657,115 @@ fn workspace_output_name(layout: &Layout<TestWindow>, ws_name: usize) -> &str {
         .and_then(|(monitor, _, _)| monitor)
         .unwrap()
         .output_name()
+}
+
+#[test]
+fn sole_tiled_population_and_manual_resize() {
+    let mut layout = Layout::default();
+    assert!(!layout.single_window_fill_enabled());
+    layout.enable_single_window_fill();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+        ],
+    );
+    let win = layout.windows().next().unwrap().1.clone();
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+    assert_eq!(win.requested_size(), Some((1280, 720).into()));
+
+    layout.set_window_width(Some(&1), SizeChange::SetFixed(500));
+    layout.update_config(&Config::default());
+    assert!(layout.single_window_fill_enabled());
+    layout.refresh(true);
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+    assert_eq!(win.requested_size().unwrap().w, 500);
+
+    let output = layout.outputs().next().unwrap().clone();
+    layout.move_column_to_output(&output, None, true);
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+    assert_eq!(win.requested_size().unwrap().w, 500);
+
+    let add_second = Op::AddWindow {
+        params: TestWindowParams::new(2),
+    };
+    // Both population changes happen without a refresh between them.
+    check_ops_on_layout(
+        &mut layout,
+        [add_second.clone(), Op::CloseWindow(2), Op::Communicate(1)],
+    );
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+    assert!(layout.interactive_resize_begin(1, ResizeEdge::RIGHT));
+    assert!(layout.interactive_resize_update(&1, (-80., 0.).into()));
+    layout.interactive_resize_end(&1);
+    layout.refresh(true);
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+    assert_eq!(win.requested_size().unwrap().w, 1200);
+
+    check_ops_on_layout(&mut layout, [add_second.clone(), Op::CloseWindow(2)]);
+    layout.toggle_window_height(Some(&1), true);
+    layout.refresh(true);
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+
+    check_ops_on_layout(&mut layout, [add_second.clone(), Op::CloseWindow(2)]);
+    assert!(layout.interactive_resize_begin(1, ResizeEdge::RIGHT));
+    layout.expand_column_to_available_width();
+    assert!(!layout.interactive_resize_update(&1, (-80., 0.).into()));
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+    assert_eq!(win.requested_size().unwrap().w, 1248);
+    layout.toggle_full_width();
+    assert_eq!(win.requested_size().unwrap().w, 1200);
+
+    add_second.clone().apply(&mut layout);
+    Op::CloseWindow(2).apply(&mut layout);
+    // An explicit request adopts an already automatically maximized window.
+    assert!(layout.interactive_resize_begin(1, ResizeEdge::RIGHT));
+    layout.set_maximized(&1, true);
+    assert!(!layout.interactive_resize_update(&1, (-80., 0.).into()));
+    add_second.apply(&mut layout);
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+    assert!(!layout.interactive_resize_begin(1, ResizeEdge::RIGHT));
+}
+
+#[test]
+fn sole_tiled_transfers_share_population_policy() {
+    for whole_column in [false, true] {
+        let mut layout = Layout::default();
+        layout.enable_single_window_fill();
+        check_ops_on_layout(
+            &mut layout,
+            [
+                Op::AddOutput(1),
+                Op::AddWindow {
+                    params: TestWindowParams::new(1),
+                },
+                Op::AddWindow {
+                    params: TestWindowParams::new(2),
+                },
+            ],
+        );
+        if whole_column {
+            layout.move_column_to_workspace_down(true);
+        } else {
+            layout.move_to_workspace_down(true);
+        }
+        for (_, win) in layout.windows() {
+            assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+        }
+        if whole_column {
+            layout.move_column_to_workspace_up(true);
+        } else {
+            layout.move_to_workspace_up(true);
+        }
+        for (_, win) in layout.windows() {
+            assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+            assert_eq!(win.requested_size().unwrap().w, 100);
+        }
+        layout.verify_invariants();
+    }
 }
 
 #[test]
@@ -4038,10 +4150,12 @@ proptest! {
     fn random_operations_dont_panic(
         ops: Vec<Op>,
         layout_config in arbitrary_layout_part(),
+        single_window_fill: bool,
     ) {
         // eprintln!("{ops:?}");
         let options = Options {
             layout: niri_config::Layout::from_part(&layout_config),
+            single_window_fill,
             ..Default::default()
         };
 

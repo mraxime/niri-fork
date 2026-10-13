@@ -5,6 +5,7 @@ use smithay::wayland::shell::xdg::ToplevelSurface;
 use smithay::wayland::xdg_activation::XdgActivationTokenData;
 
 use super::ResolvedWindowRules;
+use crate::layout::AutoMaximize;
 
 #[derive(Debug)]
 pub struct Unmapped {
@@ -22,8 +23,8 @@ pub enum InitialConfigureState {
         /// Whether the window requested to be fullscreened, and the requested output, if any.
         wants_fullscreen: Option<Option<Output>>,
 
-        /// Whether the window requested to be maximized.
-        wants_maximized: bool,
+        /// Whether the window requested maximization or explicitly requested normal size.
+        wants_maximized: Option<bool>,
     },
     /// The window has been configured.
     Configured {
@@ -74,6 +75,9 @@ pub enum InitialConfigureState {
         /// window is also pending fullscreen, then it has the Fullscreen toplevel state, so we
         /// need to store pending maximized elsewhere, hence this field.
         is_pending_maximized: bool,
+
+        /// Predicted automatic maximization or explicit normal opening intent.
+        auto_maximize: AutoMaximize,
     },
 }
 
@@ -84,7 +88,7 @@ impl Unmapped {
             window,
             state: InitialConfigureState::NotConfigured {
                 wants_fullscreen: None,
-                wants_maximized: false,
+                wants_maximized: None,
             },
             activation_token_data: None,
         }

@@ -28,7 +28,7 @@ use super::{
     RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
-use crate::layout::RenderLayer;
+use crate::layout::{AutoMaximize, RenderLayer};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -645,6 +645,9 @@ impl<W: LayoutElement> Workspace<W> {
     ) {
         self.enter_output_for_window(tile.window());
         tile.restore_to_floating = is_floating;
+        let mode = tile.window().pending_sizing_mode();
+        let can_float = mode.is_normal()
+            || (tile.auto_maximize == AutoMaximize::Active && !mode.is_fullscreen());
 
         match target {
             WorkspaceAddWindowTarget::Auto => {
@@ -653,7 +656,7 @@ impl<W: LayoutElement> Workspace<W> {
 
                 // If the tile is pending maximized or fullscreen, open it in the scrolling layout
                 // where it can do that.
-                if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                if is_floating && can_float {
                     self.floating.add_tile(tile, activate);
 
                     if activate || self.scrolling.is_empty() {
@@ -682,7 +685,7 @@ impl<W: LayoutElement> Workspace<W> {
 
                 let floating_has_window = self.floating.has_window(next_to);
 
-                if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                if is_floating && can_float {
                     if floating_has_window {
                         self.floating.add_tile_above(next_to, tile, activate);
                     } else {
@@ -760,7 +763,8 @@ impl<W: LayoutElement> Workspace<W> {
             self.enter_output_for_window(tile.window());
         }
 
-        self.scrolling.add_column(None, column, activate, anim);
+        self.scrolling
+            .add_column(None, column, activate, anim, false);
 
         if activate {
             self.floating_is_active = FloatingActive::No;
@@ -1306,13 +1310,15 @@ impl<W: LayoutElement> Workspace<W> {
                 .find(|col| col.contains(window))
                 .unwrap();
 
-            // When going from fullscreen to maximized, don't consider restore_to_floating yet.
-            if col.is_pending_fullscreen() && !col.is_pending_maximized() {
+            // Only explicit maximization defers the return to floating.
+            if col.is_pending_fullscreen() {
                 let (tile, _) = col
                     .tiles()
                     .find(|(tile, _)| tile.window().id() == window)
                     .unwrap();
-                if tile.restore_to_floating {
+                if tile.restore_to_floating
+                    && (!col.is_pending_maximized() || tile.auto_maximize == AutoMaximize::Active)
+                {
                     // Unfullscreen and float in one call so it has a chance to notice and request a
                     // (0, 0) size, rather than the scrolling column size.
                     self.toggle_window_floating(Some(window));
@@ -1336,7 +1342,7 @@ impl<W: LayoutElement> Workspace<W> {
             .tiles_mut()
             .find(|tile| tile.window().id() == window)
             .unwrap();
-        if was_normal && !tile.window().pending_sizing_mode().is_normal() {
+        if restore_to_floating || (was_normal && !tile.window().pending_sizing_mode().is_normal()) {
             tile.restore_to_floating = restore_to_floating;
         }
     }
@@ -1395,7 +1401,7 @@ impl<W: LayoutElement> Workspace<W> {
             .tiles_mut()
             .find(|tile| tile.window().id() == window)
             .unwrap();
-        if was_normal && !tile.window().pending_sizing_mode().is_normal() {
+        if restore_to_floating || (was_normal && !tile.window().pending_sizing_mode().is_normal()) {
             tile.restore_to_floating = restore_to_floating;
         }
     }
@@ -1428,7 +1434,8 @@ impl<W: LayoutElement> Workspace<W> {
             .unwrap();
 
         if self.floating.has_window(&id) {
-            let removed = self.floating.remove_tile(&id);
+            let mut removed = self.floating.remove_tile(&id);
+            removed.tile.restore_to_floating = false;
             // FIXME: compute closest pos?
             self.scrolling.add_tile(
                 None,

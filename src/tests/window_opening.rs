@@ -3,11 +3,152 @@ use std::fmt::{self, Write as _};
 use insta::assert_snapshot;
 use niri_config::Config;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 
 use super::*;
 use crate::layout::LayoutElement as _;
 use crate::utils::spawning::store_and_increase_nofile_rlimit;
 use crate::utils::with_toplevel_role;
+
+#[test]
+fn sole_tiled_initial_configure_has_no_border() {
+    let config = Config::parse_mem(
+        r#"
+        layout {
+            gaps 30
+            struts { left 40; right 40; top 40; bottom 40; }
+            border { on; width 6; }
+        }
+        window-rule { default-window-height { fixed 300; }; }
+    "#,
+    )
+    .unwrap();
+    let mut f = Fixture::with_config(config);
+    f.niri().layout.enable_single_window_fill();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let panel = f.client(id).create_layer(None, Layer::Top, "");
+    let panel_surface = panel.surface.clone();
+    panel.set_configure_props(client::LayerConfigureProps {
+        anchor: Some(Anchor::Top | Anchor::Left | Anchor::Right),
+        size: Some((0, 50)),
+        exclusive_zone: Some(50),
+        ..Default::default()
+    });
+    panel.commit();
+    f.roundtrip(id);
+    let panel = f.client(id).layer(&panel_surface);
+    panel.attach_new_buffer();
+    panel.set_size(1920, 50);
+    panel.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    let configure = &window.pending_configure;
+    assert_eq!(configure.size, (1920, 1030));
+    assert!(configure.states.contains(&xdg_toplevel::State::Maximized));
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let layout = &mut f.niri().layout;
+    let workspace = layout.active_workspace().unwrap();
+    let tile = workspace.scrolling().tiles().next().unwrap();
+    assert!(tile.sizing_mode().is_maximized());
+    assert!(tile.window().pending_sizing_mode().is_maximized());
+    assert_eq!(tile.effective_border_width(), None);
+
+    // Fullscreen must still restore a formerly floating window directly to floating.
+    let window = tile.window().window.clone();
+    layout.toggle_window_floating(Some(&window));
+    layout.set_fullscreen(&window, true);
+    layout.set_fullscreen(&window, false);
+    let workspace = layout.active_workspace().unwrap();
+    assert!(workspace.floating().has_window(&window));
+}
+
+#[test]
+fn sole_tiled_opening_intent_survives_mapping() {
+    use WantMaximized::*;
+
+    for (rule, request, size) in [
+        ("", UnsetAfterInitial, (936, 1048)),
+        ("", UnsetBeforeInitial, (936, 1048)),
+        ("open-maximized-to-edges false", No, (936, 1048)),
+        ("open-maximized-to-edges false", BeforeInitial, (936, 1048)),
+        (
+            "open-maximized-to-edges true",
+            UnsetBeforeInitial,
+            (1920, 1080),
+        ),
+        (
+            "open-maximized-to-edges true",
+            UnsetAfterInitial,
+            (936, 1048),
+        ),
+        ("open-maximized-to-edges false", AfterInitial, (1920, 1080)),
+        (
+            "open-maximized true; open-maximized-to-edges false",
+            No,
+            (1888, 1048),
+        ),
+        ("open-maximized false", No, (1920, 1080)),
+    ] {
+        let config = Config::parse_mem(&format!("window-rule {{\n{rule}\n}}")).unwrap();
+        let mut f = Fixture::with_config(config);
+        f.niri().layout.enable_single_window_fill();
+        f.add_output(1, (1920, 1080));
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        match request {
+            UnsetBeforeInitial => window.unset_maximized(),
+            BeforeInitial => window.set_maximized(),
+            _ => (),
+        }
+        window.commit();
+        f.roundtrip(id);
+        match request {
+            UnsetAfterInitial => f.client(id).window(&surface).unset_maximized(),
+            AfterInitial => f.client(id).window(&surface).set_maximized(),
+            _ => (),
+        }
+        f.roundtrip(id);
+        let window = f.client(id).window(&surface);
+        assert_eq!(window.pending_configure.size, size, "{rule}, {request}");
+        window.attach_new_buffer();
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+        let configure = &f.client(id).window(&surface).pending_configure;
+        assert_eq!(configure.size, size, "{rule}, {request}");
+        assert_eq!(
+            configure.states.contains(&xdg_toplevel::State::Maximized),
+            size == (1920, 1080)
+        );
+
+        // Opening intent is consumed: a later population transition rearms automatic fill.
+        let second = f.client(id).create_window();
+        let second_surface = second.surface.clone();
+        second.commit();
+        f.roundtrip(id);
+        let second = f.client(id).window(&second_surface);
+        second.attach_new_buffer();
+        second.ack_last_and_commit();
+        f.double_roundtrip(id);
+        let second = f.client(id).window(&second_surface);
+        second.attach_null();
+        second.commit();
+        f.double_roundtrip(id);
+        let configure = &f.client(id).window(&surface).pending_configure;
+        assert_eq!(configure.size, (1920, 1080));
+        assert!(configure.states.contains(&xdg_toplevel::State::Maximized));
+    }
+}
 
 #[test]
 fn simple_no_workspaces() {
